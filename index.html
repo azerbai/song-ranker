@@ -121,28 +121,45 @@
                     uniqueSingles.sort(sortByDate);
 
                     setLoadingStatus(`Assembling tracklists...`);
+                    
+                    // --- BATCHED FETCH ENGINE TO PREVENT RATE LIMITS / CORS ERRORS ---
                     const fetchTracksForGroup = async (list) => {
-                        const promises = list.map(async (album) => {
-                            try {
-                                const trackUrl = `https://itunes.apple.com/lookup?id=${album.collectionId}&entity=song`;
-                                const res = await fetch(trackUrl);
-                                const data = await res.json();
-                                
-                                const tracks = data.results
-                                    .filter(item => item.wrapperType === 'track' && item.kind === 'song')
-                                    .sort((a, b) => a.trackNumber - b.trackNumber)
-                                    .map(item => item.trackName);
+                        const results = [];
+                        const batchSize = 5;
 
-                                return {
-                                    title: `${album.collectionName} (${new Date(album.releaseDate).getFullYear()})`,
-                                    tracks: tracks
-                                };
-                            } catch (err) {
-                                return null;
+                        for (let i = 0; i < list.length; i += batchSize) {
+                            const batch = list.slice(i, i + batchSize);
+                            
+                            setLoadingStatus(`Assembling tracklists (${Math.min(i + batchSize, list.length)} / ${list.length})...`);
+
+                            const batchPromises = batch.map(async (album) => {
+                                try {
+                                    const trackUrl = `https://itunes.apple.com/lookup?id=${album.collectionId}&entity=song`;
+                                    const res = await fetch(trackUrl);
+                                    const data = await res.json();
+                                    
+                                    const tracks = data.results
+                                        .filter(item => item.wrapperType === 'track' && item.kind === 'song')
+                                        .sort((a, b) => a.trackNumber - b.trackNumber)
+                                        .map(item => item.trackName);
+
+                                    return {
+                                        title: `${album.collectionName} (${new Date(album.releaseDate).getFullYear()})`,
+                                        tracks: tracks
+                                    };
+                                } catch (err) {
+                                    return null;
+                                }
+                            });
+
+                            const batchResults = await Promise.all(batchPromises);
+                            results.push(...batchResults.filter(a => a !== null && a.tracks.length > 0));
+                            
+                            if (i + batchSize < list.length) {
+                                await new Promise(resolve => setTimeout(resolve, 100)); // Brief 100ms API cooldown
                             }
-                        });
-                        const results = await Promise.all(promises);
-                        return results.filter(a => a !== null && a.tracks.length > 0);
+                        }
+                        return results;
                     };
 
                     const finalAlbums = await fetchTracksForGroup(uniqueAlbums);
@@ -306,26 +323,25 @@
                 return [...mainList].reduce((acc, currentRun) => acc.concat(currentRun), []);
             }, [mainList]);
 
-            // --- SHARING UTILITIES ---
+            // --- SHARING UTILITIES (STATIC LINK UPDATED) ---
             const getShareData = () => {
                 const totalTracks = sortedResults.length;
                 const artistName = selectedArtist ? selectedArtist.name : "Artist";
-                const pageUrl = window.location.origin + window.location.pathname;
+                const pageUrl = "https://azerbai.github.io/song-ranker/";
 
-                // Take Top 5 and Bottom 5 (safely adjusted for short lists)
                 const topCount = Math.min(5, totalTracks);
                 const bottomCount = totalTracks > 5 ? Math.min(5, totalTracks - topCount) : 0;
 
                 const topTracks = sortedResults.slice(0, topCount);
                 const bottomTracks = bottomCount > 0 ? sortedResults.slice(-bottomCount) : [];
 
-                let textCard = `🏆 My ${artistName} Discography Rank:\n\n🔥 TOP:\n`;
+                let textCard = `💿 My ${artistName} Discography Rank:\n\n🏆 TOP:\n`;
                 topTracks.forEach((t, i) => {
                     textCard += `${i + 1}. ${t.name}\n`;
                 });
 
                 if (bottomTracks.length > 0) {
-                    textCard += `\n💀 BOTTOM:\n`;
+                    textCard += `\n📉 BOTTOM:\n`;
                     bottomTracks.forEach((t, i) => {
                         const actualRank = totalTracks - bottomTracks.length + i + 1;
                         textCard += `${actualRank}. ${t.name}\n`;
@@ -560,7 +576,7 @@
                                 <p class="text-gray-400 text-sm mt-1">Personalized song hierarchy generated using an absolute merge-sort matrix</p>
                             </div>
 
-                            {/* --- NEW TWITTER / CARD SHARE HUB --- */}
+                            {/* --- TWITTER / CARD SHARE HUB --- */}
                             <div class="bg-gray-950/80 border border-gray-800/80 rounded-2xl p-4 mb-6 flex flex-col sm:flex-row items-center justify-between gap-4">
                                 <div class="flex items-center gap-3 text-center sm:text-left">
                                     <div class="w-10 h-10 rounded-xl bg-violet-600/10 border border-violet-500/20 flex items-center justify-center text-violet-400 shrink-0 hidden sm:flex">
