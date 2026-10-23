@@ -4,31 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Discography Sorter</title>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <meta name="description" content="Rank every song by your favorite artist with head-to-head matchups.">
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.0.0"></script>
+    <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght=300;400;500;600;700&display=swap');
         body {
             font-family: 'Inter', sans-serif;
             background-color: #0B0F19;
         }
-        .custom-scrollbar::-webkit-scrollbar {
-            width: 6px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-            background: rgba(15, 23, 42, 0.6);
-            border-radius: 8px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-            background: rgba(139, 92, 246, 0.3);
-            border-radius: 8px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-            background: rgba(139, 92, 246, 0.5);
-        }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.3); border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.5); }
     </style>
 </head>
 <body class="text-gray-100 min-h-screen flex flex-col justify-between selection:bg-violet-500 selection:text-white">
@@ -36,458 +29,619 @@
     <div id="root" class="w-full flex-grow flex flex-col"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useMemo } = React;
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        const STORAGE_KEY = "discographySorter.session.v2";
+        const SHARE_URL = "https://azerbai.github.io/song-ranker/";
+        const ITUNES = "https://itunes.apple.com";
+
+        // ---------- helpers ----------
+
+        const getJson = async (url) => {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`The music catalog returned an error (${res.status}). Try again in a moment.`);
+            return res.json();
+        };
+
+        // Collapses "Deluxe", "Remastered", "(Explicit)" etc. so duplicate releases/tracks match.
+        const normalizeTitle = (s) => s.toLowerCase()
+            .replace(/[(\[][^)\]]*\b(deluxe|explicit|clean|expanded|bonus|remaster(ed)?|anniversary|edition|version|collector'?s)\b[^)\]]*[)\]]/g, "")
+            .replace(/\s+-\s+.*\b(deluxe|edition|remaster(ed)?|version|single|ep)\b.*$/, "")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const shuffle = (arr) => {
+            const a = arr.slice();
+            for (let i = a.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [a[i], a[j]] = [a[j], a[i]];
+            }
+            return a;
+        };
+
+        const bigArt = (url) => (url ? url.replace("100x100", "400x400") : null);
+
+        // ---------- merge sort engine ----------
+        // The whole sort is a pure function of (shuffled items, votes), so undo, resume
+        // after a refresh, and the progress bar all come from replaying the vote string.
+
+        const initSort = (items) => ({ queue: items.map(t => [t]), li: 0, ri: 0, merged: [] });
+
+        const stepSort = (state, vote) => {
+            const { queue, li, ri, merged } = state;
+            const [left, right] = queue;
+            const out = merged.slice();
+            let nl = li, nr = ri;
+
+            if (vote === "l") { out.push(left[li]); nl++; }
+            else if (vote === "r") { out.push(right[ri]); nr++; }
+            else { out.push(left[li], right[ri]); nl++; nr++; } // tie: keep both, left first
+
+            if (nl >= left.length || nr >= right.length) {
+                const done = out.concat(left.slice(nl), right.slice(nr));
+                return { queue: [...queue.slice(2), done], li: 0, ri: 0, merged: [] };
+            }
+            return { queue, li: nl, ri: nr, merged: out };
+        };
+
+        const replay = (items, votes) =>
+            [...votes].reduce((s, v) => (s.queue.length < 2 ? s : stepSort(s, v)), initSort(items));
+
+        const mergeCost = (sizes) => {
+            const q = sizes.slice();
+            let total = 0;
+            while (q.length > 1) {
+                const a = q.shift(), b = q.shift();
+                total += a + b - 1;
+                q.push(a + b);
+            }
+            return total;
+        };
+
+        const worstCase = (n) => mergeCost(Array(n).fill(1));
+
+        const remainingWorstCase = ({ queue, li, ri }) => {
+            if (queue.length < 2) return 0;
+            const [a, b] = queue;
+            const rest = queue.slice(2).map(q => q.length);
+            return (a.length - li) + (b.length - ri) - 1 + mergeCost([...rest, a.length + b.length]);
+        };
+
+        // Best available ordering at any moment (exact once the sort is finished).
+        const currentRanking = ({ queue, li, ri, merged }) => {
+            if (queue.length < 2) return queue[0] || [];
+            const [left, right] = queue;
+            return [...merged, ...left.slice(li), ...right.slice(ri), ...queue.slice(2).flat()];
+        };
+
+        // ---------- persistence ----------
+
+        const loadSession = () => {
+            try {
+                const s = JSON.parse(localStorage.getItem(STORAGE_KEY));
+                if (s && Array.isArray(s.items) && s.items.length > 1 && typeof s.votes === "string" && /^[lrt]*$/.test(s.votes)) return s;
+            } catch (e) { /* storage unavailable or corrupt */ }
+            return null;
+        };
+        const saveSession = (s) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch (e) {} };
+        const clearSession = () => { try { localStorage.removeItem(STORAGE_KEY); } catch (e) {} };
+
+        // ---------- small components ----------
+
+        function Art({ src, className }) {
+            return src
+                ? <img src={src} alt="" loading="lazy" className={`object-cover bg-gray-950 ${className}`} />
+                : <div className={`bg-gray-950 border border-gray-800 flex items-center justify-center text-gray-600 ${className}`}><i className="fa-solid fa-music"></i></div>;
+        }
+
+        function PreviewButton({ track, playing, onToggle, className = "" }) {
+            if (!track.preview) return null;
+            return (
+                <button
+                    type="button"
+                    onClick={(e) => onToggle(track, e)}
+                    aria-label={playing ? "Pause preview" : "Play 30 second preview"}
+                    className={`flex items-center justify-center rounded-lg border transition shrink-0 ${
+                        playing ? "bg-violet-600 border-violet-500 text-white" : "bg-gray-950/60 border-gray-800 text-gray-400 hover:text-white hover:border-violet-500/40"
+                    } ${className}`}
+                >
+                    <i className={`fa-solid ${playing ? "fa-pause" : "fa-play"} text-xs`}></i>
+                </button>
+            );
+        }
+
+        function TrackCard({ track, onPick, playing, onPreview, keyHint }) {
+            return (
+                <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={onPick}
+                    onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(); } }}
+                    className="group bg-gradient-to-b from-gray-900 via-gray-900 to-gray-950 border border-gray-800 hover:border-violet-500/50 focus:outline-none focus:ring-2 focus:ring-violet-500 rounded-2xl p-5 sm:p-7 flex flex-col items-center text-center cursor-pointer md:hover:-translate-y-1 transition-all duration-300 shadow-xl"
+                >
+                    <Art src={bigArt(track.art)} className="w-28 h-28 sm:w-40 sm:h-40 rounded-xl shadow-lg mb-4 sm:mb-5" />
+                    <h3 className="text-lg sm:text-xl font-bold text-white tracking-tight group-hover:text-violet-300 transition break-words">{track.name}</h3>
+                    <p className="text-xs text-gray-500 mt-1 line-clamp-1">{track.album}</p>
+                    <div className="mt-5 sm:mt-6 w-full flex gap-2">
+                        <PreviewButton track={track} playing={playing} onToggle={onPreview} className="w-11" />
+                        <div className="flex-1 bg-gray-950/60 border border-gray-800 py-2.5 rounded-xl text-xs font-semibold text-gray-400 group-hover:text-white group-hover:bg-violet-600 transition">
+                            Pick this one <span className="hidden sm:inline text-gray-600 group-hover:text-violet-200 ml-1">{keyHint}</span>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function Loading({ status }) {
+            return (
+                <div className="text-center py-2 text-sm text-violet-400 font-medium animate-pulse">
+                    <i className="fa-solid fa-database mr-2"></i> {status}
+                </div>
+            );
+        }
+
+        function ErrorBox({ message }) {
+            if (!message) return null;
+            return (
+                <div className="bg-red-950/40 border border-red-900/50 text-red-400 text-xs p-3 rounded-lg flex items-center gap-2">
+                    <i className="fa-solid fa-triangle-exclamation shrink-0"></i>
+                    <span>{message}</span>
+                </div>
+            );
+        }
+
+        const primaryBtn = "w-full bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-gray-800 disabled:to-gray-800 disabled:text-gray-500 text-white font-semibold py-4 rounded-xl transition shadow-lg shadow-indigo-600/20 active:scale-[0.99] disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center gap-2";
+        const panel = "bg-gray-900/60 backdrop-blur-xl border border-gray-800/80 rounded-3xl shadow-2xl w-full mx-auto";
+
+        // ---------- app ----------
 
         function App() {
-            const [screen, setScreen] = useState(1); // 1: Search, 2: Filter, 3: Matchup, 4: Results
+            const boot = useMemo(loadSession, []);
+
+            const [screen, setScreen] = useState("search"); // search | pick | filter | sort | results
             const [artistQuery, setArtistQuery] = useState("");
             const [isLoading, setIsLoading] = useState(false);
             const [loadingStatus, setLoadingStatus] = useState("");
             const [errorMessage, setErrorMessage] = useState("");
-            
-            const [selectedArtist, setSelectedArtist] = useState(null);
-            const [selectedCollections, setSelectedCollections] = useState([]);
+
+            const [candidates, setCandidates] = useState([]);
+            const [artist, setArtist] = useState(null);
+            const [selected, setSelected] = useState(new Set());
             const [activeTab, setActiveTab] = useState("albums");
 
-            // --- TRUE MERGE SORT STATE ENGINE ---
-            const [mainList, setMainList] = useState([]);      
-            const [leftIndex, setLeftIndex] = useState(0);      
-            const [rightIndex, setRightIndex] = useState(0);    
-            const [mergedArray, setMergedArray] = useState([]);  
-            
-            const [matchIndex, setMatchIndex] = useState(0);
-            const [estimatedTotal, setEstimatedTotal] = useState(0);
-            const [matchHistory, setMatchHistory] = useState([]);
-            const [shareCopied, setShareCopied] = useState(false);
+            // The ranking session (persisted).
+            const [sessionArtist, setSessionArtist] = useState(boot ? boot.artistName : "");
+            const [items, setItems] = useState(boot ? boot.items : []);
+            const [votes, setVotes] = useState(boot ? boot.votes : "");
+            const [early, setEarly] = useState(boot ? !!boot.early : false);
 
-            const fetchArtistDiscography = async (e) => {
+            const [copied, setCopied] = useState(null);
+            const [playingId, setPlayingId] = useState(null);
+            const audioRef = useRef(null);
+
+            // ----- derived sort state -----
+            const sortState = useMemo(() => replay(items, votes), [items, votes]);
+            const isDone = items.length > 1 && sortState.queue.length === 1;
+            const ranking = useMemo(() => currentRanking(sortState), [sortState]);
+            const worst = useMemo(() => worstCase(items.length), [items]);
+            const progress = isDone ? 100
+                : worst === 0 ? 0
+                : Math.min(99, Math.floor((1 - remainingWorstCase(sortState) / worst) * 100));
+            const pair = !isDone && sortState.queue.length > 1
+                ? [sortState.queue[0][sortState.li], sortState.queue[1][sortState.ri]]
+                : null;
+
+            // ----- audio -----
+            const stopAudio = () => {
+                if (audioRef.current) audioRef.current.pause();
+                setPlayingId(null);
+            };
+
+            const togglePreview = (track, e) => {
+                e.stopPropagation();
+                if (!audioRef.current) {
+                    audioRef.current = new Audio();
+                    audioRef.current.onended = () => setPlayingId(null);
+                }
+                const audio = audioRef.current;
+                if (playingId === track.id) { stopAudio(); return; }
+                audio.src = track.preview;
+                audio.play().catch(() => setPlayingId(null));
+                setPlayingId(track.id);
+            };
+
+            // ----- persistence -----
+            useEffect(() => {
+                if (items.length > 1) saveSession({ artistName: sessionArtist, items, votes, early });
+                else clearSession();
+            }, [items, votes, early, sessionArtist]);
+
+            useEffect(() => {
+                if (screen === "sort" && isDone) { stopAudio(); setScreen("results"); }
+            }, [screen, isDone]);
+
+            // ----- keyboard: ← / → pick, ↓ or T tie, Z undo -----
+            useEffect(() => {
+                if (screen !== "sort") return;
+                const onKey = (e) => {
+                    if (e.metaKey || e.altKey || /INPUT|TEXTAREA/.test(e.target.tagName)) return;
+                    if (e.key === "ArrowLeft") { e.preventDefault(); vote("l"); }
+                    else if (e.key === "ArrowRight") { e.preventDefault(); vote("r"); }
+                    else if (e.key === "ArrowDown" || e.key.toLowerCase() === "t") { e.preventDefault(); vote("t"); }
+                    else if (e.key.toLowerCase() === "z") { e.preventDefault(); undo(); }
+                };
+                window.addEventListener("keydown", onKey);
+                return () => window.removeEventListener("keydown", onKey);
+            }, [screen, votes, isDone]);
+
+            // ----- search & load -----
+            const searchArtist = async (e) => {
                 if (e) e.preventDefault();
-                if (!artistQuery.trim()) return;
+                const query = artistQuery.trim();
+                if (!query) return;
 
                 setIsLoading(true);
                 setErrorMessage("");
                 setLoadingStatus("Searching for artist...");
-
                 try {
-                    const artistUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(artistQuery)}&entity=musicArtist&limit=1`;
-                    const artistResponse = await fetch(artistUrl);
-                    const artistData = await artistResponse.json();
-                    if (!artistData.results || artistData.results.length === 0) {
-                        throw new Error(`Could not find an artist matching "${artistQuery}"`);
+                    const data = await getJson(`${ITUNES}/search?term=${encodeURIComponent(query)}&entity=musicArtist&limit=6`);
+                    const seen = new Set();
+                    const results = (data.results || []).filter(r => r.artistId && !seen.has(r.artistId) && seen.add(r.artistId));
+                    if (results.length === 0) throw new Error(`Could not find an artist matching "${query}"`);
+
+                    if (results.length === 1 || results[0].artistName.toLowerCase() === query.toLowerCase()) {
+                        await loadDiscography(results[0]);
+                    } else {
+                        setCandidates(results);
+                        setScreen("pick");
+                        setIsLoading(false);
+                        setLoadingStatus("");
                     }
+                } catch (error) {
+                    setErrorMessage(error.message || "Something went wrong while searching.");
+                    setIsLoading(false);
+                    setLoadingStatus("");
+                }
+            };
 
-                    const targetArtist = artistData.results[0];
-                    const artistId = targetArtist.artistId;
-                    
-                    setLoadingStatus(`Loading catalog groups...`);
-
-                    const albumsUrl = `https://itunes.apple.com/lookup?id=${artistId}&entity=album&limit=200`;
-                    const albumsResponse = await fetch(albumsUrl);
-                    const albumsData = await albumsResponse.json();
-
-                    const rawCollections = albumsData.results.filter(item => 
-                        item.wrapperType === 'collection' && 
-                        !item.collectionName.toLowerCase().includes("tribute") &&
-                        !item.collectionName.toLowerCase().includes("karaoke")
+            const loadDiscography = async (target) => {
+                setIsLoading(true);
+                setErrorMessage("");
+                setLoadingStatus(`Loading ${target.artistName}'s catalog...`);
+                try {
+                    const albumsData = await getJson(`${ITUNES}/lookup?id=${target.artistId}&entity=album&limit=200`);
+                    const raw = (albumsData.results || []).filter(item =>
+                        item.wrapperType === "collection" &&
+                        !/tribute|karaoke/i.test(item.collectionName)
                     );
+                    if (raw.length === 0) throw new Error("No musical projects were found for this artist.");
 
-                    if (rawCollections.length === 0) {
-                        throw new Error("No musical projects were found for this artist.");
-                    }
-
-                    const uniqueAlbums = [];
-                    const uniqueSingles = [];
-                    const seenNames = new Set();
-                    
-                    rawCollections.forEach(item => {
-                        const baseName = item.collectionName.replace(/\s*\(?(Explicit|Clean|Deluxe|Super Deluxe|Expanded|Bonus Track)\)?\s*/gi, "").trim().toLowerCase();
-                        if (!seenNames.has(baseName)) {
-                            seenNames.add(baseName);
-                            
-                            const isSingleOrEP = item.trackCount <= 6 || 
-                                                 item.collectionName.toLowerCase().includes("single") || 
-                                                 item.collectionName.toLowerCase().includes("- ep");
-                            
-                            if (isSingleOrEP) {
-                                uniqueSingles.push(item);
-                            } else {
-                                uniqueAlbums.push(item);
-                            }
-                        }
+                    const albums = [], singles = [], seen = new Set();
+                    raw.forEach(item => {
+                        const key = normalizeTitle(item.collectionName);
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        const isSingleOrEP = item.trackCount <= 6 || /single|- ep$/i.test(item.collectionName);
+                        (isSingleOrEP ? singles : albums).push(item);
                     });
+                    const byDate = (a, b) => new Date(b.releaseDate) - new Date(a.releaseDate);
+                    albums.sort(byDate);
+                    singles.sort(byDate);
 
-                    const sortByDate = (a, b) => new Date(b.releaseDate) - new Date(a.releaseDate);
-                    uniqueAlbums.sort(sortByDate);
-                    uniqueSingles.sort(sortByDate);
-
-                    setLoadingStatus(`Assembling tracklists...`);
-                    
-                    // --- BATCHED FETCH ENGINE TO PREVENT RATE LIMITS / CORS ERRORS ---
-                    const fetchTracksForGroup = async (list) => {
-                        const results = [];
-                        const batchSize = 5;
-
-                        for (let i = 0; i < list.length; i += batchSize) {
-                            const batch = list.slice(i, i + batchSize);
-                            
-                            setLoadingStatus(`Assembling tracklists (${Math.min(i + batchSize, list.length)} / ${list.length})...`);
-
-                            const batchPromises = batch.map(async (album) => {
-                                try {
-                                    const trackUrl = `https://itunes.apple.com/lookup?id=${album.collectionId}&entity=song`;
-                                    const res = await fetch(trackUrl);
-                                    const data = await res.json();
-                                    
-                                    const tracks = data.results
-                                        .filter(item => item.wrapperType === 'track' && item.kind === 'song')
-                                        .sort((a, b) => a.trackNumber - b.trackNumber)
-                                        .map(item => item.trackName);
-
-                                    return {
-                                        title: `${album.collectionName} (${new Date(album.releaseDate).getFullYear()})`,
-                                        tracks: tracks
-                                    };
-                                } catch (err) {
-                                    return null;
-                                }
-                            });
-
-                            const batchResults = await Promise.all(batchPromises);
-                            results.push(...batchResults.filter(a => a !== null && a.tracks.length > 0));
-                            
-                            if (i + batchSize < list.length) {
-                                await new Promise(resolve => setTimeout(resolve, 100)); // Brief 100ms API cooldown
-                            }
+                    const total = albums.length + singles.length;
+                    let done = 0;
+                    const fetchGroup = async (album) => {
+                        try {
+                            const data = await getJson(`${ITUNES}/lookup?id=${album.collectionId}&entity=song`);
+                            const tracks = (data.results || [])
+                                .filter(r => r.wrapperType === "track" && r.kind === "song")
+                                .sort((a, b) => (a.discNumber || 1) - (b.discNumber || 1) || a.trackNumber - b.trackNumber)
+                                .map(r => ({ name: r.trackName, preview: r.previewUrl || null }));
+                            return {
+                                title: `${album.collectionName} (${new Date(album.releaseDate).getFullYear()})`,
+                                art: album.artworkUrl100 || null,
+                                tracks,
+                            };
+                        } catch (err) {
+                            return null;
+                        } finally {
+                            setLoadingStatus(`Assembling tracklists (${++done} / ${total})...`);
                         }
-                        return results;
                     };
 
-                    const finalAlbums = await fetchTracksForGroup(uniqueAlbums);
-                    const finalSingles = await fetchTracksForGroup(uniqueSingles);
-                    
-                    setSelectedArtist({
-                        name: targetArtist.artistName,
-                        albums: finalAlbums,
-                        singles: finalSingles
-                    });
-                    setSelectedCollections(finalAlbums.slice(0, 3).map(a => a.title));
-                    setActiveTab(finalAlbums.length > 0 ? "albums" : "singles");
-                    setScreen(2);
+                    // Small batches keep the (unauthenticated) API happy.
+                    const fetchAll = async (list) => {
+                        const out = [];
+                        for (let i = 0; i < list.length; i += 6) {
+                            out.push(...await Promise.all(list.slice(i, i + 6).map(fetchGroup)));
+                            if (i + 6 < list.length) await new Promise(r => setTimeout(r, 100));
+                        }
+                        return out.filter(g => g && g.tracks.length > 0);
+                    };
 
+                    const finalAlbums = await fetchAll(albums);
+                    const finalSingles = await fetchAll(singles);
+                    if (finalAlbums.length + finalSingles.length === 0) throw new Error("No tracklists could be loaded for this artist.");
+
+                    setArtist({ name: target.artistName, albums: finalAlbums, singles: finalSingles });
+                    setSelected(new Set(finalAlbums.slice(0, 3).map(a => a.title)));
+                    setActiveTab(finalAlbums.length > 0 ? "albums" : "singles");
+                    setScreen("filter");
                 } catch (error) {
                     setErrorMessage(error.message || "An error occurred while fetching the discography data.");
+                    setScreen("search");
                 } finally {
                     setIsLoading(false);
                     setLoadingStatus("");
                 }
             };
 
+            // ----- filter screen -----
+            const selectionItems = useMemo(() => {
+                if (!artist) return [];
+                const seen = new Set();
+                const out = [];
+                [...artist.albums, ...artist.singles].forEach(group => {
+                    if (!selected.has(group.title)) return;
+                    group.tracks.forEach(t => {
+                        const key = normalizeTitle(t.name);
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push({ id: `t${out.length}`, name: t.name, album: group.title, art: group.art, preview: t.preview });
+                    });
+                });
+                return out;
+            }, [artist, selected]);
+
             const toggleCollection = (title) => {
-                if (selectedCollections.includes(title)) {
-                    setSelectedCollections(selectedCollections.filter(c => c !== title));
-                } else {
-                    setSelectedCollections([...selectedCollections, title]);
-                }
+                const next = new Set(selected);
+                next.has(title) ? next.delete(title) : next.add(title);
+                setSelected(next);
+            };
+
+            const setTabSelection = (on) => {
+                const next = new Set(selected);
+                artist[activeTab].forEach(g => on ? next.add(g.title) : next.delete(g.title));
+                setSelected(next);
             };
 
             const startSorting = () => {
-                let items = [];
-                const allSourceGroups = [...selectedArtist.albums, ...selectedArtist.singles];
-                
-                allSourceGroups.forEach(group => {
-                    if (selectedCollections.includes(group.title)) {
-                        group.tracks.forEach(trackName => {
-                            if (!items.some(t => t.name.toLowerCase() === trackName.toLowerCase())) {
-                                items.push({
-                                    id: Math.random().toString(36).substr(2, 9),
-                                    name: trackName,
-                                    album: group.title
-                                });
-                            }
-                        });
-                    }
-                });
-
-                if (items.length < 2) {
-                    alert("Please select categories containing at least 2 unique tracks.");
-                    return;
-                }
-
-                items.sort(() => Math.random() - 0.5);
-                const initialMainList = items.map(track => [track]);
-
-                setMainList(initialMainList);
-                setLeftIndex(0);
-                setRightIndex(0);
-                setMergedArray([]);
-                setMatchIndex(0);
-                setEstimatedTotal(Math.ceil(items.length * Math.log2(items.length) * 0.7));
-                setMatchHistory([]);
-                setShareCopied(false);
-                setScreen(3);
+                if (selectionItems.length < 2) return;
+                stopAudio();
+                setItems(shuffle(selectionItems));
+                setVotes("");
+                setEarly(false);
+                setSessionArtist(artist.name);
+                setScreen("sort");
             };
 
-            const currentMatchTracks = useMemo(() => {
-                if (screen !== 3 || mainList.length <= 1) return [null, null];
-                const leftList = mainList[0];
-                const rightList = mainList[1];
+            // ----- voting -----
+            function vote(v) {
+                if (isDone) return;
+                stopAudio();
+                setVotes(prev => prev + v);
+            }
 
-                if (!leftList || !rightList || leftIndex >= leftList.length || rightIndex >= rightList.length) {
-                    return [null, null];
-                }
+            function undo() {
+                if (votes.length === 0) return;
+                stopAudio();
+                setVotes(prev => prev.slice(0, -1));
+                setEarly(false);
+                setScreen("sort");
+            }
 
-                return [leftList[leftIndex], rightList[rightIndex]];
-            }, [screen, mainList, leftIndex, rightIndex]);
+            // ----- navigation -----
+            const goHome = () => { stopAudio(); setErrorMessage(""); setScreen("search"); };
 
-            const handleVote = (winnerCase) => {
-                const historySnapshot = {
-                    mainList: JSON.parse(JSON.stringify(mainList)),
-                    leftIndex,
-                    rightIndex,
-                    mergedArray: JSON.parse(JSON.stringify(mergedArray)),
-                    matchIndex
-                };
-                setMatchHistory(prev => [...prev, historySnapshot]);
-
-                const leftList = mainList[0];
-                const rightList = mainList[1];
-                
-                let nextLeftIdx = leftIndex;
-                let nextRightIdx = rightIndex;
-                let nextMerged = [...mergedArray];
-
-                if (winnerCase === 'left') {
-                    nextMerged.push(leftList[leftIndex]);
-                    nextLeftIdx++;
-                } else if (winnerCase === 'right') {
-                    nextMerged.push(rightList[rightIndex]);
-                    nextRightIdx++;
-                } else {
-                    if (Math.random() > 0.5) {
-                        nextMerged.push(leftList[leftIndex], rightList[rightIndex]);
-                    } else {
-                        nextMerged.push(rightList[rightIndex], leftList[leftIndex]);
-                    }
-                    nextLeftIdx++;
-                    nextRightIdx++;
-                }
-
-                if (nextLeftIdx >= leftList.length || nextRightIdx >= rightList.length) {
-                    if (nextLeftIdx < leftList.length) {
-                        nextMerged = nextMerged.concat(leftList.slice(nextLeftIdx));
-                    }
-                    if (nextRightIdx < rightList.length) {
-                        nextMerged = nextMerged.concat(rightList.slice(nextRightIdx));
-                    }
-
-                    let updatedMainList = mainList.slice(2);
-                    updatedMainList.push(nextMerged);
-
-                    setMainList(updatedMainList);
-                    setLeftIndex(0);
-                    setRightIndex(0);
-                    setMergedArray([]);
-
-                    if (updatedMainList.length === 1) {
-                        setScreen(4);
-                        return;
-                    }
-                } else {
-                    setLeftIndex(nextLeftIdx);
-                    setRightIndex(nextRightIdx);
-                    setMergedArray(nextMerged);
-                }
-
-                setMatchIndex(prev => prev + 1);
+            const startOver = () => {
+                stopAudio();
+                setItems([]);
+                setVotes("");
+                setEarly(false);
+                setSessionArtist("");
+                setArtist(null);
+                setArtistQuery("");
+                setErrorMessage("");
+                setScreen("search");
             };
 
-            const handleUndo = () => {
-                if (matchHistory.length === 0) return;
-                const previous = matchHistory[matchHistory.length - 1];
-                setMatchHistory(prev => prev.slice(0, -1));
-                setMainList(previous.mainList);
-                setLeftIndex(previous.leftIndex);
-                setRightIndex(previous.rightIndex);
-                setMergedArray(previous.mergedArray);
-                setMatchIndex(previous.matchIndex);
-            };
+            const resume = () => setScreen(isDone || early ? "results" : "sort");
 
-            const progressPercent = useMemo(() => {
-                if (estimatedTotal === 0) return 0;
-                if (mainList.length === 1 && screen === 4) return 100;
-                return Math.min(Math.floor((matchIndex / Math.max(matchIndex + 1, estimatedTotal)) * 100), 99);
-            }, [matchIndex, estimatedTotal, mainList, screen]);
-
-            const sortedResults = useMemo(() => {
-                if (mainList.length === 0) return [];
-                return [...mainList].reduce((acc, currentRun) => acc.concat(currentRun), []);
-            }, [mainList]);
-
-            // --- SHARING UTILITIES (STATIC LINK UPDATED) ---
-            const getShareData = () => {
-                const totalTracks = sortedResults.length;
-                const artistName = selectedArtist ? selectedArtist.name : "Artist";
-                const pageUrl = "https://azerbai.github.io/song-ranker/";
-
-                const topCount = Math.min(5, totalTracks);
-                const bottomCount = totalTracks > 5 ? Math.min(5, totalTracks - topCount) : 0;
-
-                const topTracks = sortedResults.slice(0, topCount);
-                const bottomTracks = bottomCount > 0 ? sortedResults.slice(-bottomCount) : [];
-
-                let textCard = `💿 My ${artistName} Discography Rank:\n\n🏆 TOP:\n`;
-                topTracks.forEach((t, i) => {
-                    textCard += `${i + 1}. ${t.name}\n`;
-                });
-
-                if (bottomTracks.length > 0) {
-                    textCard += `\n📉 BOTTOM:\n`;
-                    bottomTracks.forEach((t, i) => {
-                        const actualRank = totalTracks - bottomTracks.length + i + 1;
-                        textCard += `${actualRank}. ${t.name}\n`;
-                    });
+            // ----- sharing -----
+            const buildCard = (topN, bottomN) => {
+                const total = ranking.length;
+                const top = ranking.slice(0, Math.min(topN, total));
+                const bottomCount = Math.min(bottomN, Math.max(0, total - top.length));
+                let text = `💿 My ${sessionArtist} Discography Rank:\n\n🏆 TOP:\n`;
+                top.forEach((t, i) => { text += `${i + 1}. ${t.name}\n`; });
+                if (bottomCount > 0) {
+                    text += `\n📉 BOTTOM:\n`;
+                    ranking.slice(-bottomCount).forEach((t, i) => { text += `${total - bottomCount + i + 1}. ${t.name}\n`; });
                 }
-
-                textCard += `\nSort yours here: ${pageUrl}`;
-                return { textCard, pageUrl, artistName };
+                return text + `\nSort yours here: ${SHARE_URL}`;
             };
+
+            // Tweets count every URL as 23 characters; trim the card until it fits.
+            const tweetLength = (s) => s.replace(SHARE_URL, "x".repeat(23)).length;
 
             const handleTwitterShare = () => {
-                const { textCard } = getShareData();
-                const twitterUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(textCard)}`;
-                window.open(twitterUrl, '_blank', 'noopener,noreferrer');
+                const text = [[5, 5], [5, 0], [3, 0], [1, 0]].map(([t, b]) => buildCard(t, b)).find(c => tweetLength(c) <= 280)
+                    || buildCard(1, 0);
+                window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`, "_blank", "noopener,noreferrer");
             };
 
-            const handleClipboardCopy = () => {
-                const { textCard } = getShareData();
-                navigator.clipboard.writeText(textCard).then(() => {
-                    setShareCopied(true);
-                    setTimeout(() => setShareCopied(false), 2500);
-                });
+            const copy = (key, text) => {
+                navigator.clipboard.writeText(text).then(() => {
+                    setCopied(key);
+                    setTimeout(() => setCopied(null), 2500);
+                }).catch(() => {});
             };
 
-            const resetApp = () => {
-                setArtistQuery("");
-                setSelectedArtist(null);
-                setSelectedCollections([]);
-                setMainList([]);
-                setMatchHistory([]);
-                setScreen(1);
-                setErrorMessage("");
-            };
+            const fullRankingText = () =>
+                `💿 ${sessionArtist} – my full ranking:\n\n` +
+                ranking.map((t, i) => `${i + 1}. ${t.name}`).join("\n") +
+                `\n\nSort yours here: ${SHARE_URL}`;
+
+            // ----- render -----
+            const choicesMade = votes.length;
 
             return (
-                <div class="flex flex-col flex-grow w-full max-w-4xl mx-auto px-4 py-8 justify-center">
-                    
-                    {/* --- HEADER --- */}
-                    <header class="text-center mb-8 flex flex-col items-center justify-center">
-                        <div class="flex items-center gap-3 cursor-pointer" onClick={resetApp}>
-                            <div class="bg-gradient-to-tr from-violet-600 to-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-500/20">
-                                <i class="fa-solid fa-compact-disc text-2xl text-white"></i>
+                <div className="flex flex-col flex-grow w-full max-w-4xl mx-auto px-4 py-6 sm:py-8 justify-center">
+
+                    {/* HEADER */}
+                    <header className="text-center mb-6 sm:mb-8 flex flex-col items-center justify-center">
+                        <button type="button" className="flex items-center gap-3 cursor-pointer" onClick={goHome}>
+                            <div className="bg-gradient-to-tr from-violet-600 to-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-500/20">
+                                <i className="fa-solid fa-compact-disc text-2xl text-white"></i>
                             </div>
-                            <h1 class="text-3xl font-bold tracking-tight bg-gradient-to-r from-white via-gray-200 to-gray-400 bg-clip-text text-transparent">
+                            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight bg-gradient-to-r from-white via-gray-200 to-gray-400 bg-clip-text text-transparent">
                                 Discography Sorter
                             </h1>
-                        </div>
-                        <p class="text-xs text-gray-400 mt-2 tracking-wide uppercase font-medium">Rank your favorite music track by track</p>
+                        </button>
+                        <p className="text-xs text-gray-400 mt-2 tracking-wide uppercase font-medium">Rank your favorite music track by track</p>
                     </header>
 
-                    {/* --- SCREEN 1: SEARCH --- */}
-                    {screen === 1 && (
-                        <div class="bg-gray-900/60 backdrop-blur-xl border border-gray-800/80 rounded-3xl p-8 shadow-2xl max-w-xl w-full mx-auto">
-                            <h2 class="text-2xl font-bold text-center text-white mb-2">Search for an Artist</h2>
-                            <p class="text-gray-400 text-sm text-center mb-8">Enter any artist name to automatically pull their complete album history and tracklists.</p>
-                           
-                            <form onSubmit={fetchArtistDiscography} class="space-y-6">
-                                <div class="relative">
-                                    <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-gray-500">
-                                        {isLoading ? <i class="fa-solid fa-circle-notch animate-spin text-violet-500"></i> : <i class="fa-solid fa-magnifying-glass"></i>}
+                    {/* SEARCH */}
+                    {screen === "search" && (
+                        <div className="max-w-xl w-full mx-auto space-y-4">
+                            {items.length > 1 && !isLoading && (
+                                <div className="bg-violet-950/20 border border-violet-500/30 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-bold text-white truncate">
+                                            {isDone ? "Finished" : "In progress"}: {sessionArtist}
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-0.5">
+                                            {items.length} songs · {choicesMade} choices made{isDone ? "" : ` · ${progress}% done`}
+                                        </p>
                                     </div>
-                                    <input 
-                                        type="text"
-                                        disabled={isLoading}
-                                        placeholder="Enter artist name (e.g., Drake, Lana Del Rey...)"
-                                        class="w-full bg-gray-950 border border-gray-800 text-white rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-all placeholder:text-gray-600 shadow-inner disabled:opacity-60"
-                                        value={artistQuery}
-                                        onChange={(e) => setArtistQuery(e.target.value)}
-                                    />
+                                    <div className="flex gap-2 shrink-0">
+                                        <button onClick={resume} className="bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold px-4 py-2.5 rounded-lg transition">
+                                            {isDone || early ? "View results" : "Resume"}
+                                        </button>
+                                        <button onClick={startOver} className="bg-gray-900 border border-gray-800 text-gray-400 hover:text-white text-xs font-semibold px-4 py-2.5 rounded-lg transition">
+                                            Discard
+                                        </button>
+                                    </div>
                                 </div>
+                            )}
 
-                                {isLoading && (
-                                    <div class="text-center py-2 text-sm text-violet-400 font-medium animate-pulse">
-                                        <i class="fa-solid fa-database mr-2"></i> {loadingStatus}
+                            <div className={`${panel} p-6 sm:p-8`}>
+                                <h2 className="text-2xl font-bold text-center text-white mb-2">Search for an Artist</h2>
+                                <p className="text-gray-400 text-sm text-center mb-8">Enter any artist name to automatically pull their complete album history and tracklists.</p>
+
+                                <form onSubmit={searchArtist} className="space-y-6">
+                                    <div className="relative">
+                                        <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-gray-500">
+                                            {isLoading ? <i className="fa-solid fa-circle-notch animate-spin text-violet-500"></i> : <i className="fa-solid fa-magnifying-glass"></i>}
+                                        </div>
+                                        <input
+                                            type="text"
+                                            autoFocus
+                                            disabled={isLoading}
+                                            placeholder="Enter artist name (e.g., Drake, Lana Del Rey...)"
+                                            className="w-full bg-gray-950 border border-gray-800 text-white rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-all placeholder:text-gray-600 shadow-inner disabled:opacity-60"
+                                            value={artistQuery}
+                                            onChange={(e) => setArtistQuery(e.target.value)}
+                                        />
                                     </div>
-                                )}
 
-                                {errorMessage && (
-                                    <div class="bg-red-950/40 border border-red-900/50 text-red-400 text-xs p-3 rounded-lg flex items-center gap-2">
-                                        <i class="fa-solid fa-triangle-exclamation shrink-0"></i>
-                                        <span>{errorMessage}</span>
-                                    </div>
-                                )}
+                                    {isLoading && <Loading status={loadingStatus} />}
+                                    <ErrorBox message={errorMessage} />
 
-                                <button 
-                                    type="submit"
-                                    disabled={isLoading || !artistQuery.trim()}
-                                    class="w-full bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-gray-800 disabled:to-gray-800 text-white font-semibold py-4 rounded-xl transition shadow-lg shadow-indigo-600/20 active:scale-[0.99] disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                                >
-                                    {isLoading ? "Loading Catalog..." : "Load Discography"} <i class="fa-solid fa-arrow-right text-sm"></i>
-                                </button>
-                            </form>
+                                    <button type="submit" disabled={isLoading || !artistQuery.trim()} className={primaryBtn}>
+                                        {isLoading ? "Loading Catalog..." : "Load Discography"} <i className="fa-solid fa-arrow-right text-sm"></i>
+                                    </button>
+                                </form>
+                            </div>
                         </div>
                     )}
 
-                    {/* --- SCREEN 2: FILTER --- */}
-                    {screen === 2 && selectedArtist && (
-                        <div class="bg-gray-900/60 backdrop-blur-xl border border-gray-800/80 rounded-3xl p-8 shadow-2xl max-w-2xl w-full mx-auto">
-                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 pb-4 border-b border-gray-800/60">
-                                <div class="flex items-center gap-4">
-                                    <button onClick={() => setScreen(1)} class="text-gray-400 hover:text-white bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50 transition">
-                                        <i class="fa-solid fa-arrow-left"></i>
+                    {/* ARTIST PICKER */}
+                    {screen === "pick" && (
+                        <div className={`${panel} p-6 sm:p-8 max-w-xl`}>
+                            <div className="flex items-center gap-4 mb-6">
+                                <button onClick={goHome} className="text-gray-400 hover:text-white bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50 transition" aria-label="Back">
+                                    <i className="fa-solid fa-arrow-left"></i>
+                                </button>
+                                <div>
+                                    <h2 className="text-xl font-bold text-white">Which artist?</h2>
+                                    <p className="text-gray-400 text-xs">Several matches for "{artistQuery}"</p>
+                                </div>
+                            </div>
+                            <div className="space-y-2">
+                                {candidates.map(c => (
+                                    <button
+                                        key={c.artistId}
+                                        disabled={isLoading}
+                                        onClick={() => loadDiscography(c)}
+                                        className="w-full text-left flex items-center justify-between p-4 rounded-xl border bg-gray-950/40 border-gray-800/80 hover:border-violet-500/40 hover:bg-violet-950/20 transition disabled:opacity-50"
+                                    >
+                                        <span className="font-medium text-sm text-white truncate">{c.artistName}</span>
+                                        <span className="text-xs text-gray-500 shrink-0 ml-3">{c.primaryGenreName || ""}</span>
                                     </button>
-                                    <div>
-                                        <h2 class="text-2xl font-bold text-white">{selectedArtist.name}</h2>
-                                        <p class="text-gray-400 text-xs uppercase tracking-wider font-semibold">Select items to include</p>
+                                ))}
+                            </div>
+                            {isLoading && <div className="mt-4"><Loading status={loadingStatus} /></div>}
+                        </div>
+                    )}
+
+                    {/* FILTER */}
+                    {screen === "filter" && artist && (
+                        <div className={`${panel} p-6 sm:p-8 max-w-2xl`}>
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-5 pb-4 border-b border-gray-800/60">
+                                <div className="flex items-center gap-4 min-w-0">
+                                    <button onClick={goHome} className="text-gray-400 hover:text-white bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50 transition shrink-0" aria-label="Back">
+                                        <i className="fa-solid fa-arrow-left"></i>
+                                    </button>
+                                    <div className="min-w-0">
+                                        <h2 className="text-2xl font-bold text-white truncate">{artist.name}</h2>
+                                        <p className="text-gray-400 text-xs uppercase tracking-wider font-semibold">Select items to include</p>
                                     </div>
                                 </div>
-                                
-                                <div class="flex bg-gray-950 p-1 rounded-xl border border-gray-800/80 self-start sm:self-auto">
-                                    <button 
-                                        onClick={() => setActiveTab("albums")}
-                                        class={`px-4 py-2 rounded-lg text-xs font-semibold transition ${activeTab === 'albums' ? 'bg-violet-600 text-white' : 'text-gray-400 hover:text-gray-200'}`}
-                                    >
-                                        Albums ({selectedArtist.albums.length})
-                                    </button>
-                                    <button 
-                                        onClick={() => setActiveTab("singles")}
-                                        class={`px-4 py-2 rounded-lg text-xs font-semibold transition ${activeTab === 'singles' ? 'bg-violet-600 text-white' : 'text-gray-400 hover:text-gray-200'}`}
-                                    >
-                                        Singles & EPs ({selectedArtist.singles.length})
-                                    </button>
+
+                                <div className="flex bg-gray-950 p-1 rounded-xl border border-gray-800/80 self-start sm:self-auto shrink-0">
+                                    {[["albums", "Albums"], ["singles", "Singles & EPs"]].map(([key, label]) => (
+                                        <button
+                                            key={key}
+                                            onClick={() => setActiveTab(key)}
+                                            className={`px-4 py-2 rounded-lg text-xs font-semibold transition ${activeTab === key ? "bg-violet-600 text-white" : "text-gray-400 hover:text-gray-200"}`}
+                                        >
+                                            {label} ({artist[key].length})
+                                        </button>
+                                    ))}
                                 </div>
                             </div>
 
-                            <div class="space-y-3 mb-8 max-h-80 overflow-y-auto pr-2 custom-scrollbar">
-                                {selectedArtist[activeTab].map((group) => {
-                                    const isChecked = selectedCollections.includes(group.title);
+                            <div className="flex items-center justify-between mb-3 text-xs">
+                                <span className="text-gray-500">{selected.size} selected</span>
+                                <div className="flex gap-3 font-semibold">
+                                    <button onClick={() => setTabSelection(true)} className="text-violet-400 hover:text-violet-300">Select all</button>
+                                    <button onClick={() => setTabSelection(false)} className="text-gray-500 hover:text-gray-300">Clear</button>
+                                </div>
+                            </div>
+
+                            <div className="space-y-2 mb-6 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
+                                {artist[activeTab].length === 0 && (
+                                    <p className="text-sm text-gray-500 text-center py-8">Nothing here for this artist.</p>
+                                )}
+                                {artist[activeTab].map((group) => {
+                                    const isChecked = selected.has(group.title);
                                     return (
-                                        <div 
+                                        <div
                                             key={group.title}
                                             onClick={() => toggleCollection(group.title)}
-                                            class={`flex items-center justify-between p-4 rounded-xl border cursor-pointer transition select-none ${
-                                                isChecked ? 'bg-violet-950/20 border-violet-500/40 text-white' : 'bg-gray-950/40 border-gray-800/80 text-gray-400 hover:border-gray-700'
+                                            className={`flex items-center justify-between gap-3 p-3 rounded-xl border cursor-pointer transition select-none ${
+                                                isChecked ? "bg-violet-950/20 border-violet-500/40 text-white" : "bg-gray-950/40 border-gray-800/80 text-gray-400 hover:border-gray-700"
                                             }`}
                                         >
-                                            <div class="flex items-center gap-3 min-w-0 pr-2">
-                                                <i class={`fa-solid ${activeTab === 'albums' ? 'fa-compact-disc' : 'fa-record-vinyl'} shrink-0 ${isChecked ? 'text-violet-400' : 'text-gray-600'}`}></i>
-                                                <span class="font-medium text-sm truncate">{group.title}</span>
+                                            <div className="flex items-center gap-3 min-w-0">
+                                                <Art src={group.art} className="w-11 h-11 rounded-lg shrink-0" />
+                                                <span className="font-medium text-sm truncate">{group.title}</span>
                                             </div>
-                                            <div class="flex items-center gap-3 shrink-0">
-                                                <span class="text-xs bg-gray-800 text-gray-400 px-2.5 py-1 rounded-md border border-gray-700/40">{group.tracks.length} songs</span>
-                                                <div class={`w-5 h-5 rounded-md flex items-center justify-center border transition ${
-                                                    isChecked ? 'bg-violet-600 border-violet-500 text-white' : 'border-gray-600'
-                                                }`}>
-                                                    {isChecked && <i class="fa-solid fa-check text-[10px]"></i>}
+                                            <div className="flex items-center gap-3 shrink-0">
+                                                <span className="text-xs bg-gray-800 text-gray-400 px-2.5 py-1 rounded-md border border-gray-700/40">{group.tracks.length} songs</span>
+                                                <div className={`w-5 h-5 rounded-md flex items-center justify-center border transition ${isChecked ? "bg-violet-600 border-violet-500 text-white" : "border-gray-600"}`}>
+                                                    {isChecked && <i className="fa-solid fa-check text-[10px]"></i>}
                                                 </div>
                                             </div>
                                         </div>
@@ -495,163 +649,164 @@
                                 })}
                             </div>
 
-                            <button 
-                                onClick={startSorting}
-                                class="w-full bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white font-semibold py-4 rounded-xl transition shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2"
-                            >
-                                <i class="fa-solid fa-play text-xs"></i> Start Sorting Selected Songs
+                            <p className="text-center text-xs text-gray-500 mb-3 h-4">
+                                {selectionItems.length >= 2
+                                    ? `${selectionItems.length} unique songs · up to ~${worstCase(selectionItems.length)} matchups`
+                                    : "Select at least 2 songs' worth of releases"}
+                            </p>
+
+                            <button onClick={startSorting} disabled={selectionItems.length < 2} className={primaryBtn}>
+                                <i className="fa-solid fa-play text-xs"></i> Start Sorting Selected Songs
                             </button>
                         </div>
                     )}
 
-                    {/* --- SCREEN 3: MATCHUP ENGINE --- */}
-                    {screen === 3 && currentMatchTracks[0] && currentMatchTracks[1] && (
-                        <div class="w-full space-y-6 max-w-3xl mx-auto">
-                            <div class="bg-gray-900/40 backdrop-blur-md border border-gray-800/80 rounded-2xl p-4 sm:p-5 shadow-xl">
-                                <div class="flex justify-between items-center text-xs sm:text-sm font-semibold mb-2">
-                                    <span class="text-violet-400">Adaptive Sorting Progress</span>
-                                    <span class="text-gray-400">Match Step: {matchIndex + 1} ({progressPercent}%)</span>
+                    {/* MATCHUP */}
+                    {screen === "sort" && pair && (
+                        <div className="w-full space-y-5 max-w-3xl mx-auto">
+                            <div className="bg-gray-900/40 backdrop-blur-md border border-gray-800/80 rounded-2xl p-4 sm:p-5 shadow-xl">
+                                <div className="flex justify-between items-center text-xs sm:text-sm font-semibold mb-2">
+                                    <span className="text-violet-400 truncate pr-2">{sessionArtist}</span>
+                                    <span className="text-gray-400 shrink-0">Matchup {choicesMade + 1} · {progress}%</span>
                                 </div>
-                                <div class="w-full bg-gray-950 h-2.5 rounded-full overflow-hidden border border-gray-800/40 p-0.5">
-                                    <div 
-                                        class="bg-gradient-to-r from-violet-500 to-indigo-500 h-full rounded-full transition-all duration-300 ease-out"
-                                        style={{ width: `${progressPercent}%` }}
+                                <div className="w-full bg-gray-950 h-2.5 rounded-full overflow-hidden border border-gray-800/40 p-0.5">
+                                    <div
+                                        className="bg-gradient-to-r from-violet-500 to-indigo-500 h-full rounded-full transition-all duration-300 ease-out"
+                                        style={{ width: `${progress}%` }}
                                     ></div>
                                 </div>
                             </div>
 
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
-                                <div 
-                                    onClick={() => handleVote('left')}
-                                    class="group bg-gradient-to-b from-gray-900 via-gray-900 to-gray-950 hover:from-gray-900 hover:to-gray-900 border border-gray-800 hover:border-violet-500/50 rounded-2xl p-6 sm:p-8 flex flex-col justify-between items-center text-center cursor-pointer transform hover:-translate-y-1 transition-all duration-300 shadow-xl"
-                                >
-                                    <div class="w-14 h-14 rounded-full bg-gray-950 flex items-center justify-center border border-gray-800 text-gray-500 group-hover:text-violet-400 group-hover:border-violet-500/30 transition mb-6">
-                                        <i class="fa-solid fa-music text-xl"></i>
-                                    </div>
-                                    <h3 class="text-lg sm:text-xl font-bold text-white tracking-tight group-hover:text-violet-300 transition">{currentMatchTracks[0].name}</h3>
-                                    <p class="text-xs text-gray-500 mt-1 line-clamp-1">{currentMatchTracks[0].album}</p>
-                                    <div class="mt-8 w-full bg-gray-950/60 border border-gray-800 py-2 rounded-xl text-xs font-semibold text-gray-400 group-hover:text-white group-hover:bg-violet-600 transition">Select Track</div>
-                                </div>
-
-                                <div 
-                                    onClick={() => handleVote('right')}
-                                    class="group bg-gradient-to-b from-gray-900 via-gray-900 to-gray-950 hover:from-gray-900 hover:to-gray-900 border border-gray-800 hover:border-violet-500/50 rounded-2xl p-6 sm:p-8 flex flex-col justify-between items-center text-center cursor-pointer transform hover:-translate-y-1 transition-all duration-300 shadow-xl"
-                                >
-                                    <div class="w-14 h-14 rounded-full bg-gray-950 flex items-center justify-center border border-gray-800 text-gray-500 group-hover:text-violet-400 group-hover:border-violet-500/30 transition mb-6">
-                                        <i class="fa-solid fa-music text-xl"></i>
-                                    </div>
-                                    <h3 class="text-lg sm:text-xl font-bold text-white tracking-tight group-hover:text-violet-300 transition">{currentMatchTracks[1].name}</h3>
-                                    <p class="text-xs text-gray-500 mt-1 line-clamp-1">{currentMatchTracks[1].album}</p>
-                                    <div class="mt-8 w-full bg-gray-950/60 border border-gray-800 py-2 rounded-xl text-xs font-semibold text-gray-400 group-hover:text-white group-hover:bg-violet-600 transition">Select Track</div>
-                                </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
+                                <TrackCard track={pair[0]} onPick={() => vote("l")} playing={playingId === pair[0].id} onPreview={togglePreview} keyHint="←" />
+                                <TrackCard track={pair[1]} onPick={() => vote("r")} playing={playingId === pair[1].id} onPreview={togglePreview} keyHint="→" />
                             </div>
 
-                            <div class="flex flex-wrap gap-3 justify-between items-center pt-2">
-                                <button 
-                                    onClick={handleUndo}
-                                    disabled={matchHistory.length === 0}
-                                    class={`flex items-center gap-2 px-5 py-3 rounded-xl border text-sm font-semibold transition ${
-                                        matchHistory.length === 0 ? 'bg-gray-950/20 border-gray-900 text-gray-600 cursor-not-allowed' : 'bg-gray-900/60 border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800'
-                                    }`}
+                            <div className="flex flex-wrap gap-3 justify-between items-center pt-1">
+                                <button
+                                    onClick={undo}
+                                    disabled={votes.length === 0}
+                                    className="flex items-center gap-2 px-5 py-3 rounded-xl border text-sm font-semibold transition bg-gray-900/60 border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800 disabled:bg-gray-950/20 disabled:border-gray-900 disabled:text-gray-600 disabled:cursor-not-allowed"
                                 >
-                                    <i class="fa-solid fa-rotate-left text-xs"></i> Undo Last Choice
+                                    <i className="fa-solid fa-rotate-left text-xs"></i> Undo <span className="hidden sm:inline text-gray-600">Z</span>
                                 </button>
-                                <div class="flex gap-3">
-                                    <button onClick={() => handleVote('tie')} class="bg-gray-900/60 border border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800 px-5 py-3 rounded-xl text-sm font-semibold transition">Tie / Skip</button>
-                                    <button onClick={() => setScreen(4)} class="bg-emerald-950/20 hover:bg-emerald-900/30 border border-emerald-800/40 text-emerald-400 hover:text-emerald-300 px-5 py-3 rounded-xl text-sm font-semibold transition">View Rankings Early</button>
+                                <div className="flex gap-3">
+                                    <button onClick={() => vote("t")} className="bg-gray-900/60 border border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800 px-5 py-3 rounded-xl text-sm font-semibold transition">
+                                        Tie <span className="hidden sm:inline text-gray-600">↓</span>
+                                    </button>
+                                    <button
+                                        onClick={() => { stopAudio(); setEarly(true); setScreen("results"); }}
+                                        className="bg-emerald-950/20 hover:bg-emerald-900/30 border border-emerald-800/40 text-emerald-400 hover:text-emerald-300 px-5 py-3 rounded-xl text-sm font-semibold transition"
+                                    >
+                                        Finish Early
+                                    </button>
                                 </div>
                             </div>
                         </div>
                     )}
 
-                    {/* --- SCREEN 4: RESULTS LEADERBOARD WITH TWITTER SHARING --- */}
-                    {screen === 4 && (
-                        <div class="bg-gray-900/60 backdrop-blur-xl border border-gray-800/80 rounded-3xl p-6 sm:p-8 shadow-2xl w-full max-w-2xl mx-auto">
-                            
-                            <div class="text-center mb-6">
-                                <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800/50 mb-3 shadow-lg">
-                                    <i class="fa-solid fa-crown text-xl"></i>
+                    {/* RESULTS */}
+                    {screen === "results" && (
+                        <div className={`${panel} p-5 sm:p-8 max-w-2xl`}>
+                            <div className="text-center mb-6">
+                                <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800/50 mb-3 shadow-lg">
+                                    <i className="fa-solid fa-crown text-xl"></i>
                                 </div>
-                                <h2 class="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">Your Ranked Results</h2>
-                                <p class="text-gray-400 text-sm mt-1">Personalized song hierarchy generated using an absolute merge-sort matrix</p>
+                                <h2 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">Your {sessionArtist} Ranking</h2>
+                                <p className="text-gray-400 text-sm mt-1">{ranking.length} songs · {choicesMade} choices</p>
                             </div>
 
-                            {/* --- TWITTER / CARD SHARE HUB --- */}
-                            <div class="bg-gray-950/80 border border-gray-800/80 rounded-2xl p-4 mb-6 flex flex-col sm:flex-row items-center justify-between gap-4">
-                                <div class="flex items-center gap-3 text-center sm:text-left">
-                                    <div class="w-10 h-10 rounded-xl bg-violet-600/10 border border-violet-500/20 flex items-center justify-center text-violet-400 shrink-0 hidden sm:flex">
-                                        <i class="fa-solid fa-share-nodes"></i>
+                            {!isDone && (
+                                <div className="bg-amber-950/20 border border-amber-800/40 text-amber-300 text-xs p-3 rounded-xl mb-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                    <span><i className="fa-solid fa-circle-info mr-2"></i>Partial result: you stopped at {progress}%, so only songs you've compared are reliably ordered.</span>
+                                    <button
+                                        onClick={() => { setEarly(false); setScreen("sort"); }}
+                                        className="bg-amber-600/20 hover:bg-amber-600/30 border border-amber-700/40 text-amber-200 font-semibold px-4 py-2 rounded-lg transition shrink-0"
+                                    >
+                                        Keep sorting
+                                    </button>
+                                </div>
+                            )}
+
+                            <div className="bg-gray-950/80 border border-gray-800/80 rounded-2xl p-4 mb-6 flex flex-col sm:flex-row items-center justify-between gap-4">
+                                <div className="flex items-center gap-3 text-center sm:text-left">
+                                    <div className="w-10 h-10 rounded-xl bg-violet-600/10 border border-violet-500/20 items-center justify-center text-violet-400 shrink-0 hidden sm:flex">
+                                        <i className="fa-solid fa-share-nodes"></i>
                                     </div>
                                     <div>
-                                        <h4 class="text-sm font-bold text-white">Share Your Standings</h4>
-                                        <p class="text-xs text-gray-500 mt-0.5">Post your definitive Top & Bottom tier breakdown to X / Twitter.</p>
+                                        <h4 className="text-sm font-bold text-white">Share Your Standings</h4>
+                                        <p className="text-xs text-gray-500 mt-0.5">Post your top & bottom tracks, or copy the whole list.</p>
                                     </div>
                                 </div>
-                                <div class="flex items-center gap-2.5 w-full sm:w-auto justify-center">
-                                    <button 
-                                        onClick={handleTwitterShare}
-                                        class="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-white text-black hover:bg-gray-200 font-bold text-xs transition shadow-md shrink-0 cursor-pointer"
-                                    >
-                                        <i class="fa-brands fa-x-twitter text-sm"></i> Post to Twitter
+                                <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto justify-center">
+                                    <button onClick={handleTwitterShare} className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-white text-black hover:bg-gray-200 font-bold text-xs transition shadow-md shrink-0">
+                                        <i className="fa-brands fa-x-twitter text-sm"></i> Post
                                     </button>
-                                    <button 
-                                        onClick={handleClipboardCopy}
-                                        class={`flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border font-bold text-xs transition shrink-0 cursor-pointer ${
-                                            shareCopied ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-400' : 'bg-gray-900 border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800'
-                                        }`}
-                                    >
-                                        {shareCopied ? <><i class="fa-solid fa-check"></i> Copied!</> : <><i class="fa-solid fa-copy"></i> Copy Text</>}
-                                    </button>
+                                    {[["card", "Copy Top/Bottom", () => buildCard(5, 5)], ["full", "Copy Full List", fullRankingText]].map(([key, label, getText]) => (
+                                        <button
+                                            key={key}
+                                            onClick={() => copy(key, getText())}
+                                            className={`flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border font-bold text-xs transition shrink-0 ${
+                                                copied === key ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-400" : "bg-gray-900 border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800"
+                                            }`}
+                                        >
+                                            {copied === key ? <><i className="fa-solid fa-check"></i> Copied!</> : <><i className="fa-solid fa-copy"></i> {label}</>}
+                                        </button>
+                                    ))}
                                 </div>
                             </div>
 
-                            <div class="space-y-2 max-h-[340px] overflow-y-auto pr-2 mb-6 custom-scrollbar">
-                                {sortedResults.map((song, index) => {
-                                    const rankBadgeColor = 
-                                        index === 0 ? 'bg-amber-500/10 text-amber-400 border-amber-500/30' :
-                                        index === 1 ? 'bg-slate-300/10 text-slate-300 border-slate-400/30' :
-                                        index === 2 ? 'bg-amber-700/10 text-amber-600 border-amber-800/30' :
-                                        'bg-gray-950 text-gray-500 border-gray-800/60';
+                            <div className="space-y-2 max-h-[420px] overflow-y-auto pr-2 mb-6 custom-scrollbar">
+                                {ranking.map((song, index) => {
+                                    const badge =
+                                        index === 0 ? "bg-amber-500/10 text-amber-400 border-amber-500/30" :
+                                        index === 1 ? "bg-slate-300/10 text-slate-300 border-slate-400/30" :
+                                        index === 2 ? "bg-amber-700/10 text-amber-600 border-amber-800/30" :
+                                        "bg-gray-950 text-gray-500 border-gray-800/60";
                                     return (
-                                        <div 
-                                            key={song.id || index}
-                                            class={`flex items-center justify-between p-3.5 rounded-xl border transition ${
-                                                index === 0 ? 'bg-gradient-to-r from-amber-500/5 via-transparent to-transparent border-amber-500/20' : 'bg-gray-950/40 border-gray-800/60'
+                                        <div
+                                            key={song.id}
+                                            className={`flex items-center justify-between gap-3 p-3 rounded-xl border ${
+                                                index === 0 ? "bg-gradient-to-r from-amber-500/5 via-transparent to-transparent border-amber-500/20" : "bg-gray-950/40 border-gray-800/60"
                                             }`}
                                         >
-                                            <div class="flex items-center gap-3.5 min-w-0 pr-2">
-                                                <div class={`w-8 h-7 rounded-lg flex items-center justify-center font-bold text-xs border shrink-0 ${rankBadgeColor}`}>
+                                            <div className="flex items-center gap-3 min-w-0">
+                                                <div className={`min-w-9 h-7 px-1 rounded-lg flex items-center justify-center font-bold text-xs border shrink-0 ${badge}`}>
                                                     #{index + 1}
                                                 </div>
-                                                <div class="min-w-0">
-                                                    <h4 class="font-bold text-sm text-gray-100 truncate">{song.name}</h4>
-                                                    <p class="text-xs text-gray-500 truncate mt-0.5">{song.album}</p>
+                                                <Art src={song.art} className="w-10 h-10 rounded-md shrink-0" />
+                                                <div className="min-w-0">
+                                                    <h4 className="font-bold text-sm text-gray-100 truncate">{song.name}</h4>
+                                                    <p className="text-xs text-gray-500 truncate mt-0.5">{song.album}</p>
                                                 </div>
                                             </div>
+                                            <PreviewButton track={song} playing={playingId === song.id} onToggle={togglePreview} className="w-9 h-9" />
                                         </div>
                                     );
                                 })}
                             </div>
 
-                            <button 
-                                onClick={resetApp}
-                                class="w-full bg-gray-800 hover:bg-gray-700 text-white font-semibold py-4 rounded-xl transition flex items-center justify-center gap-2 border border-gray-700/60"
-                            >
-                                <i class="fa-solid fa-arrow-rotate-right text-xs"></i> Sort Another Discography
-                            </button>
+                            <div className="flex flex-col sm:flex-row gap-3">
+                                {isDone && votes.length > 0 && (
+                                    <button onClick={undo} className="sm:w-auto bg-gray-900/60 border border-gray-800 text-gray-300 hover:text-white hover:bg-gray-800 font-semibold py-4 px-6 rounded-xl transition flex items-center justify-center gap-2">
+                                        <i className="fa-solid fa-rotate-left text-xs"></i> Undo last choice
+                                    </button>
+                                )}
+                                <button onClick={startOver} className="flex-1 bg-gray-800 hover:bg-gray-700 text-white font-semibold py-4 rounded-xl transition flex items-center justify-center gap-2 border border-gray-700/60">
+                                    <i className="fa-solid fa-arrow-rotate-right text-xs"></i> Sort Another Discography
+                                </button>
+                            </div>
                         </div>
                     )}
 
-                    {/* --- FOOTER --- */}
-                    <footer class="mt-12 text-center text-[11px] font-semibold text-gray-600 tracking-wider uppercase">
-                        Powered by client-side merge sort arrays
+                    <footer className="mt-10 text-center text-[11px] font-semibold text-gray-600 tracking-wider uppercase">
+                        Merge sort in your browser · Catalog &amp; previews from iTunes
                     </footer>
                 </div>
             );
         }
 
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<App />);
+        ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     </script>
 </body>
 </html>
